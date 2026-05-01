@@ -9,157 +9,147 @@ from scipy.interpolate import make_interp_spline
 # --- CONFIGURATION ---
 COM_PORT = 'COM5'          
 BAUD_RATE = 115200
-MAX_POINTS = 80             # Slightly fewer base points for cleaner splines
-SPLINE_POINTS = 300         # The high-resolution curve points (Visual Smoothness)
-Y_LIMITS = (-20000, 20000)  
-FPS_INTERVAL = 16           # ~60 FPS update rate
+MAX_POINTS = 80             
+SPLINE_POINTS = 300         
+VIBE_LIMITS = (-5, 5)       # Accel in 'g' units from Arduino
+CURR_LIMITS = (0, 5)        # 0A to 5A range
+TEMP_LIMITS = (20, 60)      # Normal operating temp range
+FPS_INTERVAL = 16           
 
-# --- EMA FILTER SETTINGS ---
-# 0.01 = Extremely smooth but delayed | 1.0 = Instant but jagged
-ALPHA = 0.15  
+# --- FILTERS ---
+ALPHA_VIBE = 0.2
+ALPHA_CURR = 0.1
 
 # Serial connection
 try:
     ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1)
-    print(f"🛰  Connected to {COM_PORT} – live telemetry active")
+    print(f"🛰  Telemetry Linked: {COM_PORT} at {BAUD_RATE} baud")
 except Exception as e:
     print(f"❌ Serial error: {e}")
     exit()
 
 # Data containers
-data_x = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
-data_y = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
-data_z = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
+data_ax = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
+data_ay = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
+data_az = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
+data_c1 = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
+data_c2 = deque([0]*MAX_POINTS, maxlen=MAX_POINTS)
 
-# State variables for EMA Filter
-curr_x, curr_y, curr_z = 0.0, 0.0, 0.0
+# State variables
+curr_ax, curr_ay, curr_az = 0.0, 0.0, 0.0
+curr_c1, curr_c2, curr_temp = 0.0, 0.0, 0.0
 
-# X-axis arrays for Spline interpolation
 x_axis = np.arange(MAX_POINTS)
 x_axis_smooth = np.linspace(0, MAX_POINTS - 1, SPLINE_POINTS)
 
 # ------------------------------------------------------------
-#  GRAPH STYLING
+#  UI LAYOUT & STYLING
 # ------------------------------------------------------------
 plt.style.use('dark_background')
-fig = plt.figure(figsize=(10, 6), facecolor='#050510')
-ax = fig.add_subplot(111, facecolor='#0a0a12')
-fig.canvas.manager.set_window_title('MPU6050 • ULTRA SMOOTH HUD')
+fig = plt.figure(figsize=(14, 8), facecolor='#030308')
+gs = fig.add_gridspec(2, 3)
 
-for spine in ax.spines.values():
-    spine.set_visible(False)
-ax.tick_params(colors='#2a2a3a', labelsize=8)
-ax.set_xlim(0, MAX_POINTS - 1)
-ax.set_ylim(*Y_LIMITS)
-ax.grid(True, color='#00e5ff', alpha=0.08, linewidth=0.6)
+# Panel 1: Main Vibration (MPU6050)
+ax_vibe = fig.add_subplot(gs[:, :2], facecolor='#050510')
+ax_vibe.set_title("VIBRATION TELEMETRY (g)", color='#00e5ff', fontweight='bold')
+ax_vibe.set_ylim(*VIBE_LIMITS)
+ax_vibe.grid(True, color='#00e5ff', alpha=0.05)
 
-title = ax.set_title(
-    "LIVE  MPU6050  TELEMETRY",
-    fontsize=18, fontweight='900', color='#00e5ff',
-    family='monospace', loc='center',
-    path_effects=[patheffects.withStroke(linewidth=4, foreground='#003344')]
-)
+# Panel 2: Motor Currents
+ax_curr = fig.add_subplot(gs[0, 2], facecolor='#050510')
+ax_curr.set_title("MOTOR LOAD (A)", color='#39ff14', fontweight='bold')
+ax_curr.set_ylim(*CURR_LIMITS)
 
-# --- NEON LINES ---
-def make_glowlines(color, linewidth_main=2.5):
-    glow_layers = [(8, 0.05), (5, 0.15), (3, 0.35), (linewidth_main, 1.0)]
-    lines = []
-    for lw, alpha in glow_layers:
-        # Initialize with high-resolution x_axis_smooth
-        l, = ax.plot(x_axis_smooth, [0]*SPLINE_POINTS, color=color, alpha=alpha,
-                     linewidth=lw, solid_capstyle='round', animated=True)
-        lines.append(l)
-    return lines
+# Panel 3: Temperature
+ax_temp = fig.add_subplot(gs[1, 2], facecolor='#050510')
+ax_temp.set_title("THERMAL SENSOR (°C)", color='#ff7b3d', fontweight='bold')
+ax_temp.set_ylim(*TEMP_LIMITS)
 
-lines_x = make_glowlines('#ff3d57')
-lines_y = make_glowlines('#39ff14')
-lines_z = make_glowlines('#00e5ff')
+# Styling clean-up
+for a in [ax_vibe, ax_curr, ax_temp]:
+    for spine in a.spines.values(): spine.set_visible(False)
+    a.tick_params(colors='#444466', labelsize=8)
 
-# --- SCANNING LINE ---
-scan_line = ax.axhline(0, color='#00e5ff', alpha=0.25, linewidth=1.5, linestyle='-', animated=True)
+# --- HUD ELEMENTS ---
+def make_neon_line(target_ax, color, label):
+    l, = target_ax.plot(x_axis_smooth, [0]*SPLINE_POINTS, color=color, 
+                        linewidth=2, label=label, solid_capstyle='round', animated=True)
+    l.set_path_effects([patheffects.withStroke(linewidth=4, foreground=color, alpha=0.2)])
+    return l
 
-# --- END-POINT DOTS ---
-latest_idx = MAX_POINTS - 1
-scat_x = ax.scatter([latest_idx], [0], color='#ff3d57', edgecolors='white', linewidth=1, s=100, zorder=10, animated=True)
-scat_y = ax.scatter([latest_idx], [0], color='#39ff14', edgecolors='white', linewidth=1, s=100, zorder=10, animated=True)
-scat_z = ax.scatter([latest_idx], [0], color='#00e5ff', edgecolors='white', linewidth=1, s=100, zorder=10, animated=True)
+line_ax = make_neon_line(ax_vibe, '#ff3d57', 'AX')
+line_ay = make_neon_line(ax_vibe, '#39ff14', 'AY')
+line_az = make_neon_line(ax_vibe, '#00e5ff', 'AZ')
 
-legend = ax.legend(
-    handles=[lines_x[-1], lines_y[-1], lines_z[-1]],
-    labels=['X', 'Y', 'Z'], loc='upper left', facecolor='#0a0a12',
-    edgecolor='#1a1a2e', labelcolor='#cccccc', prop={'size': 10, 'weight': 'bold'}
-)
+line_c1 = ax_curr.plot(x_axis, [0]*MAX_POINTS, color='#39ff14', label='M1 (Healthy)', animated=True)[0]
+line_c2 = ax_curr.plot(x_axis, [0]*MAX_POINTS, color='#ff3d57', label='M2 (Test)', animated=True)[0]
 
-# --------------------- ANIMATION LOOP ---------------------
-scan_y = 0
-scan_dir = 1
-scan_speed = 600
+# Static labels for current values
+txt_c1 = ax_curr.text(0.05, 0.9, '', transform=ax_curr.transAxes, color='#39ff14', fontweight='bold')
+txt_c2 = ax_curr.text(0.05, 0.8, '', transform=ax_curr.transAxes, color='#ff3d57', fontweight='bold')
+txt_temp = ax_temp.text(0.5, 0.5, '-- °C', transform=ax_temp.transAxes, 
+                        fontsize=30, ha='center', va='center', color='#ff7b3d', fontweight='bold')
 
-def get_smooth_curve(data):
-    """Converts rough points into a smooth fluid curve using Splines"""
+ax_vibe.legend(loc='upper right', fontsize=8)
+ax_curr.legend(loc='upper right', fontsize=7)
+
+# --------------------- PROCESSING ---------------------
+
+def get_smooth(data):
     try:
-        spline = make_interp_spline(x_axis, data, k=3) # k=3 is cubic spline
-        return spline(x_axis_smooth)
-    except:
-        return np.zeros(SPLINE_POINTS)
+        return make_interp_spline(x_axis, data, k=3)(x_axis_smooth)
+    except: return np.zeros(SPLINE_POINTS)
 
 def update(frame):
-    global scan_y, scan_dir, curr_x, curr_y, curr_z
+    global curr_ax, curr_ay, curr_az, curr_c1, curr_c2, curr_temp
 
-    # Read serial data
     while ser.in_waiting > 0:
         try:
-            line = ser.readline().decode('utf-8').strip()
-            parts = line.split(',')
-            if len(parts) == 3:
-                raw_x = int(parts[0].split(':')[1])
-                raw_y = int(parts[1].split(':')[1])
-                raw_z = int(parts[2].split(':')[1])
-                
-                # Apply EMA (Exponential Moving Average) Filter
-                curr_x = (ALPHA * raw_x) + ((1 - ALPHA) * curr_x)
-                curr_y = (ALPHA * raw_y) + ((1 - ALPHA) * curr_y)
-                curr_z = (ALPHA * raw_z) + ((1 - ALPHA) * curr_z)
+            # Expected: timestamp, curr1, curr2, temp, ax, ay, az, gx, gy, gz, fs
+            raw = ser.readline().decode('utf-8').strip().split(',')
+            if len(raw) == 11:
+                # 1. Currents (A)
+                c1_val = float(raw[1])
+                c2_val = float(raw[2])
+                curr_c1 = (ALPHA_CURR * c1_val) + (1 - ALPHA_CURR) * curr_c1
+                curr_c2 = (ALPHA_CURR * c2_val) + (1 - ALPHA_CURR) * curr_c2
+                data_c1.append(curr_c1)
+                data_c2.append(curr_c2)
 
-                data_x.append(curr_x)
-                data_y.append(curr_y)
-                data_z.append(curr_z)
-        except Exception:
-            pass
+                # 2. Temperature (C)
+                curr_temp = float(raw[3])
 
-    # Generate Splines
-    smooth_x = get_smooth_curve(data_x)
-    smooth_y = get_smooth_curve(data_y)
-    smooth_z = get_smooth_curve(data_z)
+                # 3. MPU6050 (g)
+                rax, ray, raz = float(raw[4]), float(raw[5]), float(raw[6])
+                curr_ax = (ALPHA_VIBE * rax) + (1 - ALPHA_VIBE) * curr_ax
+                curr_ay = (ALPHA_VIBE * ray) + (1 - ALPHA_VIBE) * curr_ay
+                curr_az = (ALPHA_VIBE * raz) + (1 - ALPHA_VIBE) * curr_az
+                data_ax.append(curr_ax)
+                data_ay.append(curr_ay)
+                data_az.append(curr_az)
+        except: pass
 
-    # Update glow layers
-    for line_set, smooth_data in [(lines_x, smooth_x), (lines_y, smooth_y), (lines_z, smooth_z)]:
-        for l in line_set:
-            l.set_ydata(smooth_data)
+    # Update Vibration Lines (Splined)
+    line_ax.set_ydata(get_smooth(data_ax))
+    line_ay.set_ydata(get_smooth(data_ay))
+    line_az.set_ydata(get_smooth(data_az))
 
-    # Move scanning line smoothly
-    scan_y += scan_dir * scan_speed * (FPS_INTERVAL / 1000.0)
-    if scan_y > Y_LIMITS[1]:
-        scan_y, scan_dir = Y_LIMITS[1], -1
-    elif scan_y < Y_LIMITS[0]:
-        scan_y, scan_dir = Y_LIMITS[0], 1
-    scan_line.set_ydata([scan_y, scan_y])
+    # Update Current Lines (Standard plot for speed)
+    line_c1.set_ydata(data_c1)
+    line_c2.set_ydata(data_c2)
 
-    # Update dots
-    scat_x.set_offsets([[latest_idx, smooth_x[-1]]])
-    scat_y.set_offsets([[latest_idx, smooth_y[-1]]])
-    scat_z.set_offsets([[latest_idx, smooth_z[-1]]])
+    # Update Text Stats
+    txt_c1.set_text(f"M1: {curr_c1:.2f} A")
+    txt_c2.set_text(f"M2: {curr_c2:.2f} A")
+    txt_temp.set_text(f"{curr_temp:.1f} °C")
 
-    return (
-        [item for sublist in [lines_x, lines_y, lines_z] for item in sublist] +
-        [scan_line, scat_x, scat_y, scat_z]
-    )
+    return line_ax, line_ay, line_az, line_c1, line_c2, txt_c1, txt_c2, txt_temp
 
-# --------------------- LAUNCH DASHBOARD ---------------------
+# --------------------- LAUNCH ---------------------
 ani = animation.FuncAnimation(fig, update, interval=FPS_INTERVAL, blit=True, cache_frame_data=False)
 
-plt.tight_layout(pad=2)
+plt.tight_layout()
 plt.show()
 
 ser.close()
-print("Dashboard closed.")
+print("System Offline.")
