@@ -34,7 +34,7 @@
 // ─── ACS712 Calibration ───────────────────────────────────
 // Measure actual Vcc with a multimeter and enter below
 #define VCC_MV          4980.0f   // millivolts (adjust if needed)
-#define ACS712_SENS     0.185f    // V/A — see note above
+#define ACS712_SENS     0.100f    // V/A — see note above
 // Offset voltage at 0A = VCC/2. We measure it at startup.
 float acs712_offset_m1 = 2.5f;
 float acs712_offset_m2 = 2.5f;
